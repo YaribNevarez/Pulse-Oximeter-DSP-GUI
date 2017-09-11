@@ -1,0 +1,19 @@
+/*
+ * main.c
+ *
+ *  Created on: 13 de feb. de 2017
+ *      Author: Yarib Nevárez
+ */
+
+#include "poxi.h"
+
+int main()
+{
+	Poxi_initialize();
+
+	Poxi_run();
+
+
+	return 0;
+}
+

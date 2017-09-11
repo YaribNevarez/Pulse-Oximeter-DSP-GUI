@@ -1,0 +1,12 @@
+vhdl xil_defaultlib "../../../bd/poxi_design/ipshared/28bc/src/spi.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ipshared/28bc/hdl/POXI_v1_0_S00_AXI.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ipshared/28bc/hdl/POXI_v1_0.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ip/poxi_design_POXI_0_0/sim/poxi_design_POXI_0_0.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ip/poxi_design_rst_ps7_0_100M_0/sim/poxi_design_rst_ps7_0_100M_0.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ipshared/e2ec/src/espi.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ipshared/e2ec/hdl/TFT_SPI_DISPLAY_240x320_v1_0_S00_AXI.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ipshared/e2ec/hdl/TFT_SPI_DISPLAY_240x320_v1_0.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/ip/poxi_design_TFT_SPI_DISPLAY_240x320_0_0/sim/poxi_design_TFT_SPI_DISPLAY_240x320_0_0.vhd" 
+vhdl xil_defaultlib "../../../bd/poxi_design/hdl/poxi_design.vhd" 
+
+nosort

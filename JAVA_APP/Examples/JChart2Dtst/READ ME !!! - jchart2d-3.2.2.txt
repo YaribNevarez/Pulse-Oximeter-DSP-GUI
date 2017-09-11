@@ -1,0 +1,7 @@
+1. In the Package-project explorer, Click on the project
+2. Right click (context menu)
+3. Select properties
+4. On the left side, select "Java Build Path"
+5. Select the tab for "Libraries"
+6. On the right side, clock on "Add External JARs"
+7. Search for "jchart2d-3.2.2.jar", and click ok >> Apply >> Ok

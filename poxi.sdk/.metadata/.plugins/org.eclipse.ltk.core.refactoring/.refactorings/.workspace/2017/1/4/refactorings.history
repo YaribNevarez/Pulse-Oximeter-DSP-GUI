@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Delete resource &apos;poxi/MATLAB&apos;" deleteContents="false" description="Delete resource &apos;poxi/MATLAB&apos;" element1="/poxi/MATLAB" flags="7" id="org.eclipse.ltk.core.refactoring.delete.resources" resources="1" stamp="1485368062803"/>
+</session>

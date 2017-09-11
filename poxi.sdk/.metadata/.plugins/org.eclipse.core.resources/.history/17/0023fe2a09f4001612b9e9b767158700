@@ -1,0 +1,615 @@
+/*
+ * Pulse oximeter application
+ *
+ * Hoschule Bremerhaven, Germany.
+ * M.Sc. Embedded Systems Design
+ *
+ * Author: Yarib Israel Nevárez Esparza
+ * Matrikelnummer: 34399
+ *
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include "platform.h"
+#include "xscugic.h"
+#include "xil_exception.h"
+#include "xscutimer.h"
+
+#include "poxi.h"
+#include "poxi_hardware.h"
+#include "graphics.h"
+#include "ui_components.h"
+#include "dsp.h"
+#include "miscellaneous.h"
+#include "guicom.h"
+#include "math.h"
+
+static uint8_t Poxi_initialize(void);
+static uint8_t Poxi_run(void);
+static void Poxi_dispose(void);
+
+static Poxi Poxi_obj = { Poxi_initialize,
+                         Poxi_run,
+                         Poxi_dispose };
+
+Poxi * Poxi_instance(void)
+{
+	return & Poxi_obj;
+}
+
+// Interruption handlers
+static XScuGic            Poxi_interruptCtrl;
+static XScuGic_Config *   Poxi_interruptConfig = NULL;
+static XScuTimer          Poxi_timer;
+static XScuTimer_Config * Poxi_timerConfig = NULL;
+static uint32_t           Poxi_timerLoad  = (3333333/40); // should be 1000 Hz (3333333 -> 100KHz)
+
+// Hardware instances
+static GUICom      * Poxi_JavaGUICom  = NULL;
+static AD5624R     * Poxi_DAC         = NULL;
+static MCP6S2X     * Poxi_PGA         = NULL;
+static AD7887      * Poxi_ADC         = NULL;
+static ZYBO        * Poxi_ZYBO        = NULL;
+static LightProbe  * Poxi_clip        = NULL;
+static TFTGraphics * Poxi_graphics    = NULL;
+
+typedef struct
+{
+    ComposedFilter * red;
+    ComposedFilter * ired;
+} Filters;
+
+static Filters Poxi_DSP;
+
+
+typedef struct
+{
+	FramePanel * framePanel;
+	TextLabel  * statusLabel;
+	TextLabel  * hbrLabel;
+	Plot2D     * tracePlot;
+} UIContent;
+
+static UIContent Poxi_UI;
+
+
+typedef enum
+{
+	SECTION_A = 0,
+	SECTION_B = 1,
+	SECTION0_LENGTH // Last item of enum
+} BufferSection0;
+
+typedef enum
+{
+	RED_LIGHT  = 0,
+	IRED_LIGHT = 1,
+	SECTION1_LENGTH // Last item of enum
+} BufferSection1;
+
+typedef enum
+{
+	PRIMITIVE_SIGNAL  = 0,
+	FILTERED_SIGNAL   = 1,
+	SECTION2_LENGTH // Last item of enum
+} BufferSection2;
+
+typedef enum
+{
+	UNAVAILABLE = -1,
+	READY_SECTION_A = SECTION_A,
+	READY_SECTION_B = SECTION_B,
+} BufferSectionStatus;
+
+#define                    POXI_SAMPLES       (3000)
+static uint32_t            Poxi_maxSampleQty = POXI_SAMPLES;
+static uint32_t            Poxi_sampleCount  = 0;
+static double              Poxi_sampleBuffer[SECTION0_LENGTH][SECTION1_LENGTH][SECTION2_LENGTH][POXI_SAMPLES];
+static BufferSection0      Poxi_sampleSection = SECTION_A;
+static BufferSectionStatus Poxi_sampleStatus = UNAVAILABLE;
+
+typedef enum
+{
+	REDLIGHT_ON,
+	SAMPLERED_OFF,
+	IREDLIGHT_ON,
+	SAMPLEIRED_OFF
+} InterrputState;
+
+InterrputState Poxi_interruptState = REDLIGHT_ON;
+
+static uint8_t Poxi_interruptDutyEnable = 0;
+
+typedef struct
+{
+	uint16_t ampGain;
+	uint16_t enviantLight;
+	uint16_t redLight;
+	uint16_t iredLight;
+	uint16_t clipSensor;
+} DAQProfile;
+
+static DAQProfile Poxi_DAQ;
+
+static void Poxi_adjust(void)
+{
+	static DAQProfile Poxi_DAQLast;
+	FilterStatistics redStat;
+	FilterStatistics iredStat;
+	uint8_t ADCTopSat;
+	uint8_t ADCMaxLevel;
+
+	redStat = Poxi_DSP.red->getStatistics(Poxi_DSP.red);
+	iredStat = Poxi_DSP.ired->getStatistics(Poxi_DSP.ired);
+
+	ADCTopSat = (redStat.maxInput.magnitude > 0x0700) || (iredStat.maxInput.magnitude > 0x0700);
+	ADCMaxLevel = redStat.maxInput.magnitude < iredStat.maxInput.magnitude ? iredStat.maxInput.magnitude : redStat.maxInput.magnitude;
+
+	if (ADCTopSat)
+	{
+		Poxi_DAQ.enviantLight += 0xF;
+		if (0x0FFF < Poxi_DAQ.enviantLight)
+		{
+			Poxi_DAQ.enviantLight = 0xFFF;
+			Poxi_DAQ.redLight -=0xF;
+			Poxi_DAQ.iredLight -=0xF;
+		}
+		Poxi_DSP.red->resetStatistics(Poxi_DSP.red);
+		Poxi_DSP.ired->resetStatistics(Poxi_DSP.ired);
+	}
+	if (ADCMaxLevel < 0x3FF)
+	{
+		Poxi_DAQ.enviantLight -= 0xF;
+		if ((int16_t)Poxi_DAQ.enviantLight < 0)
+		{
+			Poxi_DAQ.enviantLight = 0;
+			Poxi_DAQ.redLight +=0xF;
+			Poxi_DAQ.iredLight +=0xF;
+		}
+		Poxi_DSP.red->resetStatistics(Poxi_DSP.red);
+		Poxi_DSP.ired->resetStatistics(Poxi_DSP.ired);
+	}
+
+	if (Poxi_DAQ.enviantLight != Poxi_DAQLast.enviantLight)
+	{
+		Poxi_DAC->write_input_register(DAC_D, Poxi_DAQ.enviantLight);
+		Poxi_DAC->update_DAC_register(DAC_D);
+		Poxi_DAQLast.enviantLight = Poxi_DAQ.enviantLight;
+	}
+
+	if (Poxi_DAQ.redLight != Poxi_DAQLast.redLight)
+	{
+		Poxi_DAC->write_input_register(DAC_A, Poxi_DAQ.redLight);
+		Poxi_DAC->update_DAC_register(DAC_A);
+		Poxi_DAQLast.redLight = Poxi_DAQ.redLight;
+	}
+
+	if (Poxi_DAQ.iredLight != Poxi_DAQLast.iredLight)
+	{
+		Poxi_DAC->write_input_register(DAC_B, Poxi_DAQ.iredLight);
+		Poxi_DAC->update_DAC_register(DAC_B);
+		Poxi_DAQLast.iredLight = Poxi_DAQ.iredLight;
+	}
+
+	if (Poxi_DAQ.clipSensor != Poxi_DAQLast.clipSensor)
+	{
+		Poxi_DAC->write_input_register(DAC_C, Poxi_DAQ.clipSensor);
+		Poxi_DAC->update_DAC_register(DAC_C);
+		Poxi_DAQLast.clipSensor = Poxi_DAQ.clipSensor;
+	}
+
+	if (Poxi_DAQ.ampGain != Poxi_DAQLast.ampGain)
+	{
+		Poxi_PGA->set_gain(Poxi_DAQ.ampGain);
+		Poxi_DAQLast.ampGain = Poxi_DAQ.ampGain;
+	}
+}
+
+static void Poxi_timerInterruptHandler(void * data)
+{
+	static double primitiveSignal;
+	static double filteredSignal;
+	static uint32_t adjustCount = 0;
+
+	XScuTimer_ClearInterruptStatus((XScuTimer *) data);
+
+	if (Poxi_interruptDutyEnable)
+	switch (Poxi_interruptState)
+	{
+	case REDLIGHT_ON:
+		Poxi_clip->light(LIGHTPROBE_RED);
+		Poxi_interruptState = SAMPLERED_OFF;
+		break;
+
+	case SAMPLERED_OFF:
+		primitiveSignal = Poxi_ADC->read_analog();
+		Poxi_clip->light(LIGHTPROBE_OFF);
+
+		filteredSignal = Poxi_DSP.red->process(Poxi_DSP.red, primitiveSignal);
+
+		Poxi_sampleBuffer[Poxi_sampleSection][RED_LIGHT][PRIMITIVE_SIGNAL][Poxi_sampleCount] = primitiveSignal;
+		Poxi_sampleBuffer[Poxi_sampleSection][RED_LIGHT][FILTERED_SIGNAL][Poxi_sampleCount] = filteredSignal;
+
+		Poxi_interruptState = IREDLIGHT_ON;
+		break;
+
+	case IREDLIGHT_ON:
+		Poxi_clip->light(LIGHTPROBE_INFRARED);
+		Poxi_interruptState = SAMPLEIRED_OFF;
+		break;
+
+	case SAMPLEIRED_OFF:
+		primitiveSignal = Poxi_ADC->read_analog();
+		Poxi_clip->light(LIGHTPROBE_OFF);
+
+		filteredSignal = Poxi_DSP.ired->process(Poxi_DSP.ired, primitiveSignal);
+
+		Poxi_sampleBuffer[Poxi_sampleSection][IRED_LIGHT][PRIMITIVE_SIGNAL][Poxi_sampleCount] = primitiveSignal;
+		Poxi_sampleBuffer[Poxi_sampleSection][IRED_LIGHT][FILTERED_SIGNAL][Poxi_sampleCount] = filteredSignal;
+
+		Poxi_sampleCount ++;
+		if (Poxi_sampleCount >= Poxi_maxSampleQty)
+		{
+			Poxi_sampleCount = 0;
+			if (Poxi_sampleSection == SECTION_A)
+			{
+				Poxi_sampleStatus = READY_SECTION_A;
+				Poxi_sampleSection = SECTION_B;
+			}
+			else
+			{
+				Poxi_sampleStatus = READY_SECTION_B;
+				Poxi_sampleSection = SECTION_A;
+			}
+		}
+
+		if (AUTOADJUST_TIME < adjustCount)
+		{
+			Poxi_adjust();
+			adjustCount = 0;
+		}
+
+		Poxi_interruptState = REDLIGHT_ON;
+		break;
+
+	default:;
+	}
+}
+
+static uint8_t Poxi_initInterruptHandlers(void)
+{
+	Xil_ExceptionInit();
+
+	Poxi_interruptConfig = XScuGic_LookupConfig(XPAR_SCUGIC_0_DEVICE_ID);
+
+	XScuGic_CfgInitialize(&Poxi_interruptCtrl,
+                           Poxi_interruptConfig,
+                           Poxi_interruptConfig->CpuBaseAddress);
+
+	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_IRQ_INT,
+                                 (Xil_ExceptionHandler) XScuGic_InterruptHandler,
+                                 & Poxi_interruptConfig);
+
+	Poxi_timerConfig = XScuTimer_LookupConfig(XPAR_XSCUTIMER_0_DEVICE_ID);
+
+	XScuTimer_CfgInitialize(&Poxi_timer, Poxi_timerConfig, Poxi_timerConfig->BaseAddr);
+
+	XScuTimer_EnableAutoReload(&Poxi_timer);
+
+	XScuTimer_LoadTimer(&Poxi_timer, Poxi_timerLoad);
+
+	XScuGic_Connect(&Poxi_interruptCtrl,
+                     XPAR_SCUTIMER_INTR,
+                     (Xil_ExceptionHandler) Poxi_timerInterruptHandler,
+                     (void *) &Poxi_timer);
+
+	XScuGic_Enable(&Poxi_interruptCtrl, XPAR_SCUTIMER_INTR);
+
+	XScuTimer_EnableInterrupt(&Poxi_timer);
+
+    Xil_ExceptionEnable();
+
+	XScuTimer_Start(&Poxi_timer);
+
+	return 1;
+}
+
+static void Poxi_stopInterruptHandlers(void)
+{
+	XScuTimer_Stop(&Poxi_timer);
+	Xil_ExceptionDisable();
+
+	XScuTimer_DisableInterrupt(&Poxi_timer);
+	XScuGic_Disable(&Poxi_interruptCtrl, XPAR_SCUTIMER_INTR);
+}
+
+static uint8_t Poxi_JavaGUI_plot(GUITrace trace, BufferSection0 section0, BufferSection1 section1, BufferSection2 section2, uint8_t stepSample)
+{
+	uint32_t k, i;
+	static double GUISampleBuffer[POXI_SAMPLES];
+
+	for (k = i = 0; i < Poxi_maxSampleQty; i += stepSample, k ++)
+	{
+		GUISampleBuffer[k] = Poxi_sampleBuffer[section0][section1][section2][i];
+	}
+
+	return Poxi_JavaGUICom->plotSamples(trace, GUISampleBuffer, k);
+}
+
+static void Poxi_JavaGUI_report(void)
+{
+	if (Poxi_sampleStatus != UNAVAILABLE)
+	{
+		static char    msg[120];
+		static double  fundFrec;
+		static uint8_t rc;
+		static uint8_t stepSample = 50;
+
+		BufferSection0 section = (BufferSection0) Poxi_sampleStatus; // Compatible types
+
+		Poxi_JavaGUICom->clearTrace(TRACE_ALL);
+
+		fundFrec = Poxi_DSP.ired->getStatistics(Poxi_DSP.ired).fundamentalFrec;
+		sprintf(msg,"Fundamental Frec = %.2f Hz | Heartbeat rate = %.2f bpm ", fundFrec, fundFrec * 60);
+		Poxi_JavaGUICom->textMsg(0,msg);
+
+		Poxi_JavaGUICom->setStepTime(TRACE_ALL, DSP_SAMPLE_TIME*stepSample);
+
+		rc = Poxi_JavaGUI_plot(TRACE_0, section, RED_LIGHT, PRIMITIVE_SIGNAL, stepSample);
+		if (rc) rc = Poxi_JavaGUI_plot(TRACE_2, section, RED_LIGHT, FILTERED_SIGNAL, stepSample);
+		if (rc) rc = Poxi_JavaGUI_plot(TRACE_4, section, IRED_LIGHT, PRIMITIVE_SIGNAL, stepSample);
+		if (rc) rc = Poxi_JavaGUI_plot(TRACE_6, section, IRED_LIGHT, FILTERED_SIGNAL, stepSample);
+		if (rc) rc = Poxi_JavaGUI_plot(TRACE_8, section, RED_LIGHT, FILTERED_SIGNAL, stepSample);
+		if (rc) rc = Poxi_JavaGUI_plot(TRACE_9, section, IRED_LIGHT, FILTERED_SIGNAL, stepSample);
+
+		Poxi_sampleStatus = UNAVAILABLE; // Reset flags
+	}
+}
+
+static void Poxi_refreshUI(void)
+{
+	uint8_t hbr;
+
+	if (Poxi_sampleStatus == UNAVAILABLE)
+	{
+		Poxi_UI.statusLabel->set_text_color(Poxi_UI.statusLabel, RED);
+		Poxi_UI.statusLabel->set_text(Poxi_UI.statusLabel,"Sampling signal");
+	}
+
+	if (!Poxi_ZYBO->switch_(0))
+	{
+		Poxi_UI.tracePlot->add_point(Poxi_UI.tracePlot,
+						(Poxi_DSP.ired->getStatistics(Poxi_DSP.ired).currentOutput.magnitude - Poxi_DSP.ired->getStatistics(Poxi_DSP.ired).minOutput.magnitude)*10,
+						CYAN);
+	}
+
+	if (Poxi_ZYBO->button(3))
+	{
+		Poxi_DSP.ired->resetStatistics(Poxi_DSP.ired);
+	}
+
+	hbr = Poxi_DSP.ired->getStatistics(Poxi_DSP.ired).fundamentalFrec * 60;
+	if (hbr <= 120)
+	{
+		if (hbr < 50)
+			Poxi_UI.hbrLabel->set_text_color(Poxi_UI.hbrLabel, RED);
+		else if (90 < hbr)
+			Poxi_UI.hbrLabel->set_text_color(Poxi_UI.hbrLabel, MAGENTA);
+		else
+			Poxi_UI.hbrLabel->set_text_color(Poxi_UI.hbrLabel, WHITE);
+
+		Poxi_UI.hbrLabel->set_number(Poxi_UI.hbrLabel, hbr);
+	}
+}
+
+static uint8_t Poxi_JavaGUI_progressCallback(void * data, uint32_t progress, uint32_t total)
+{
+	static char text[80];
+	sprintf(text, "Java GUI Communication %d%%", (int)((100*progress)/total));
+	Poxi_UI.statusLabel->set_text_color(Poxi_UI.statusLabel, WHITE);
+	Poxi_UI.statusLabel->set_text(Poxi_UI.statusLabel, text);
+	Poxi_refreshUI();
+	return Poxi_ZYBO->switch_(3);
+}
+
+static uint8_t Poxi_run(void)
+{
+	Poxi_UI.framePanel->draw((Widget *)Poxi_UI.framePanel);
+
+	Poxi_interruptDutyEnable = 1;
+	do
+	{
+		Poxi_refreshUI();
+		if (Poxi_ZYBO->switch_(0))
+		{
+			Poxi_JavaGUI_report();
+		}
+	} while (Poxi_ZYBO->switch_(3));
+	Poxi_interruptDutyEnable = 0;
+
+	Poxi_clip->light(LIGHTPROBE_OFF);
+	Poxi_ZYBO->leds(0);
+
+	Poxi_UI.statusLabel->set_text(Poxi_UI.statusLabel,"* STOP *");
+
+	return 0;
+}
+
+static uint8_t Poxi_initGraphics(void)
+{
+	uint8_t rc = Poxi_graphics != NULL;
+
+	if (rc)
+	{
+		Poxi_graphics->initialize();
+		Poxi_graphics->speed(0xF0); // Regular SPI speed
+		Poxi_graphics->drawLine(00, 00, ILI9341_WIDTH, ILI9341_HEIGHT, RED); // GRAPHIC TEST!
+		Poxi_graphics->speed(0xFE); // Speed up !!!
+	}
+
+	return rc;
+}
+
+#define UI_LABEL_QTY (6)
+static uint8_t Poxi_initUIContent(void)
+{
+	FramePanel * frame = FramePanel_new(0, 0, MAX_WIDTH -1, MAX_HEIGHT -1, WHITE, NAVY);
+	TextLabel  * statusLabel = TextLabel_new(55, 80, 0, 0, "Starting Up", PINK, NAVY);
+	TextLabel  * hbrLabel = TextLabel_new(140, 90, 0, 0, "-", WHITE, NAVY);
+	Plot2D     * plot = Plot2D_new(30, 150, 100, 100, RED, BLACK);
+	TextLabel  * label[UI_LABEL_QTY];
+	uint8_t      i;
+	uint8_t      rc;
+
+	label[0] = TextLabel_new(25, 20, 0, 0, " Hoschule Bremerhaven          ", YELLOW, BLACK);
+	label[1] = TextLabel_new(25, 30, 0, 0, " M.Sc. Embedded Systems Design ", WHITE, BLACK);
+	label[2] = TextLabel_new(25, 40, 0, 0, " Pulse Oximeter                ", WHITE, BLACK);
+	label[3] = TextLabel_new(25, 50, 0, 0, " March 2017                    ", WHITE, BLACK);
+	label[4] = TextLabel_new(10, 80, 0, 0, "Status:", YELLOW, NAVY);
+	label[5] = TextLabel_new(10, 90, 0, 0, "Heartbeat rate (bpm):", YELLOW, NAVY);
+
+	rc = frame != NULL
+      && statusLabel != NULL
+	  && hbrLabel != NULL
+      && plot != NULL;
+
+	for (i = 0; rc && i < sizeof(label)/sizeof(TextLabel *); i++)
+		rc = rc && label[i] != NULL;
+
+	if (rc)
+	{
+		frame->give_widget(frame, (Widget *)statusLabel);
+		frame->give_widget(frame, (Widget *)plot);
+		frame->give_widget(frame, (Widget *)hbrLabel);
+		hbrLabel->set_label_type(hbrLabel, NUMBER);
+
+		for (i = 0; i < sizeof(label)/sizeof(TextLabel *); i++)
+			frame->give_widget(frame, (Widget *)label[i]);
+
+		Poxi_UI.framePanel  = frame;
+		Poxi_UI.statusLabel = statusLabel;
+		Poxi_UI.tracePlot   = plot;
+		Poxi_UI.hbrLabel    = hbrLabel;
+	}
+
+	return rc;
+}
+
+static uint8_t Poxi_initDeviceInstances()
+{
+	uint8_t rc;
+
+	Poxi_JavaGUICom  = GUICom_instance();
+	Poxi_DAC         = AD5624R_instance();
+	Poxi_PGA         = MCP6S2X_instance();
+	Poxi_ADC         = AD7887_instance();
+	Poxi_ZYBO        = ZYBO_instance();
+	Poxi_clip        = LightProbe_instance();
+	Poxi_graphics    = TFTGraphics_instance();
+
+	rc = Poxi_JavaGUICom != NULL
+	  && Poxi_DAC        != NULL
+	  && Poxi_PGA        != NULL
+	  && Poxi_ADC        != NULL
+	  && Poxi_ZYBO       != NULL
+	  && Poxi_clip       != NULL
+	  && Poxi_graphics   != NULL;
+
+	if (rc)
+	{
+		Poxi_ADC->set_reference(REF_ENABLED);
+		Poxi_ADC->set_channel_mode(SINGLE_CHANNEL);
+		Poxi_ADC->set_power_mode(MODE2);
+
+		Poxi_DAC->reset();
+		Poxi_DAC->LDAC_setup(0);
+		Poxi_DAC->power_mode(NORMAL_OPERATION, 0xF);
+		Poxi_DAC->internal_reference(REFERENCE_ON);
+
+		Poxi_DAQ.ampGain      = GAIN_32;
+		Poxi_DAQ.enviantLight = 0x08FF;
+		Poxi_DAQ.redLight     = 0x0FFF;
+		Poxi_DAQ.iredLight    = 0x0FFF;
+		Poxi_DAQ.clipSensor   = 0x0FFF;
+
+		Poxi_JavaGUICom->setProgressCallback(Poxi_JavaGUI_progressCallback, NULL);
+	}
+
+	return rc;
+}
+
+static uint8_t Poxi_initDSP(void)
+{
+	uint8_t rc;
+	ComposedFilter * filterRed  = NULL;
+	ComposedFilter * filterIred = NULL;
+
+	memset(&Poxi_DSP, 0x00, sizeof(Poxi_DSP));
+
+	filterRed = ComposedFilter_new(2,
+			Filter_new(&high_pass_filter_parameters),
+			Filter_new(&low_pass_filter_parameters));
+
+	Poxi_DSP.red = filterRed;
+	rc = filterRed != NULL;
+	if (rc)
+	{
+		filterRed->setSampleTime(filterRed, DSP_SAMPLE_TIME);
+		filterRed->setupStatistics(filterRed,
+				FUNDAMENTAL_FREC | MAX_OUTPUT | MAX_INPUT | MIN_INPUT);
+
+
+		filterIred = ComposedFilter_new(2,
+				Filter_new(&high_pass_filter_parameters),
+				Filter_new(&low_pass_filter_parameters));
+
+		Poxi_DSP.ired = filterIred;
+		rc = filterIred != NULL;
+		if (rc)
+		{
+			filterIred->setSampleTime(filterIred, DSP_SAMPLE_TIME);
+			filterIred->setupStatistics(filterIred,
+					FUNDAMENTAL_FREC | MAX_OUTPUT | MAX_INPUT | MIN_INPUT);
+		}
+	}
+
+	return rc;
+}
+
+static uint8_t Poxi_initialize(void)
+{
+	uint8_t rc;
+
+	init_platform();
+
+	rc = Poxi_initInterruptHandlers();
+	if (rc) rc = Poxi_initDeviceInstances();
+	if (rc) rc = Poxi_initGraphics();
+	if (rc) rc = Poxi_initUIContent();
+	if (rc) rc = Poxi_initDSP();
+
+	return rc;
+}
+
+static void Poxi_dispose(void)
+{
+	Poxi_stopInterruptHandlers();
+
+	cleanup_platform();
+
+	Poxi_clip->light(LIGHTPROBE_OFF);
+	Poxi_ZYBO->leds(0);
+
+	Poxi_ADC->set_power_mode(MODE1);
+	Poxi_DAC->power_mode(POWER_DOWN_THREE_STATE, 0xF);
+	Poxi_PGA->shutdown();
+
+	if (Poxi_DSP.red != NULL)
+		Poxi_DSP.red->delete(&Poxi_DSP.red);
+
+	if (Poxi_DSP.ired != NULL)
+		Poxi_DSP.ired->delete(&Poxi_DSP.ired);
+
+	if (Poxi_UI.framePanel != NULL)
+		Poxi_UI.framePanel->delete((Widget **) &Poxi_UI.framePanel);
+}

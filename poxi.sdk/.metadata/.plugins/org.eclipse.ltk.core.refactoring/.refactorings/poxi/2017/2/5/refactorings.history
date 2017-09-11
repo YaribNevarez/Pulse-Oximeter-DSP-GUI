@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">&#x0A;<refactoring comment="Rename resource &apos;poxi/src/GUICom.c&apos; to &apos;guicom.c&apos;" description="Rename resource &apos;GUICom.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="src/GUICom.c" name="guicom.c" stamp="1486085054373" updateReferences="true"/>&#x0A;<refactoring comment="Rename resource &apos;poxi/src/GUICom.h&apos; to &apos;guicom.h&apos;" description="Rename resource &apos;GUICom.h&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="src/GUICom.h" name="guicom.h" stamp="1486085073659" updateReferences="true"/>
+</session>

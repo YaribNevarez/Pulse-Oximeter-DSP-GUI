@@ -1,0 +1,300 @@
+///******************************************************************************
+//*
+//* Copyright (C) 2009 - 2014 Xilinx, Inc.  All rights reserved.
+//*
+//* Permission is hereby granted, free of charge, to any person obtaining a copy
+//* of this software and associated documentation files (the "Software"), to deal
+//* in the Software without restriction, including without limitation the rights
+//* to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//* copies of the Software, and to permit persons to whom the Software is
+//* furnished to do so, subject to the following conditions:
+//*
+//* The above copyright notice and this permission notice shall be included in
+//* all copies or substantial portions of the Software.
+//*
+//* Use of the Software is limited solely to applications:
+//* (a) running on a Xilinx device, or
+//* (b) that interact with a Xilinx device through a bus or interconnect.
+//*
+//* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+//* XILINX  BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+//* WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+//* OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//* SOFTWARE.
+//*
+//* Except as contained in this notice, the name of the Xilinx shall not be used
+//* in advertising or otherwise to promote the sale, use or other dealings in
+//* this Software without prior written authorization from Xilinx.
+//*
+//******************************************************************************/
+//
+///*
+// * helloworld.c: simple test application
+// *
+// * This application configures UART 16550 to baud rate 9600.
+// * PS7 UART (Zynq) is not initialized by this application, since
+// * bootrom/bsp configures it to baud rate 115200
+// *
+// * ------------------------------------------------
+// * | UART TYPE   BAUD RATE                        |
+// * ------------------------------------------------
+// *   uartns550   9600
+// *   uartlite    Configurable only in HW design
+// *   ps7_uart    115200 (configured by bootrom/bsp)
+// */
+//
+//#include <stdio.h>
+//#include "platform.h"
+//#include "xil_printf.h"
+//
+//
+//int main()
+//{
+//    init_platform();
+//
+//    print("Hello World\n\r");
+//
+//    cleanup_platform();
+//    return 0;
+//}
+
+#include <stdio.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xil_types.h"
+#include "xparameters.h"
+#include "xscugic.h"
+#include "xil_exception.h"
+#include "xscutimer.h"
+
+#include "poxi_hardware.h"
+#include "graphics.h"
+#include "ui_components.h"
+
+#define CBUF_LEN 64
+
+#define NREGS 8
+#define ZEDBP_REG(k)  (*(volatile u32 *)(XPAR_POXI_0_S00_AXI_BASEADDR+4*(k)))
+
+// ---- interrupt controller -----
+static XScuGic Intc;					// interrupt controller instance
+static XScuGic_Config *IntcConfig;		// configuration instance
+
+// ---- scu timer -----
+static XScuTimer pTimer;				// private Timer instance
+static XScuTimer_Config *pTimerConfig;	// configuration instance
+#define TIMER_LOAD_VALUE  3333333		// should be 100 Hz
+
+static volatile int ISR_LEDs, ISR_Count;
+
+void delay_ms(unsigned int length_ms) {
+	length_ms *= 108200;
+	while (length_ms--)
+		;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+/*
+ * ------------------------------------------------------------
+ * Interrupt handler (ZYNQ private timer)
+ * ------------------------------------------------------------
+ */
+static void TimerIntrHandler(void *CallBackRef) {
+	XScuTimer *TimerInstance = (XScuTimer *) CallBackRef;
+
+	XScuTimer_ClearInterruptStatus(TimerInstance);
+	if (ISR_Count < (100)) {
+		ISR_Count++;
+	} else {
+		ISR_Count = 0;
+		ZYBO_instance()->leds(ISR_LEDs);
+
+		if (ISR_LEDs == 1) {
+			ISR_LEDs = 0x08;
+		} else {
+			ISR_LEDs >>= 1;
+		}
+	}
+}
+
+void command_routine(void) {
+	char cbuf[CBUF_LEN], *chp;
+	int terminate = 0, isr_run, kk;
+	unsigned int regn, regval;
+
+	do {
+		print(">> ");
+		fflush(stdout);
+		fgets(cbuf, CBUF_LEN, stdin);
+		cbuf[CBUF_LEN - 1] = '\0';
+		chp = cbuf;
+		do {
+			if (*chp == '\n' || *chp == '\a') {
+				*chp = '\0';
+			}
+		} while (*chp++ != '\0');
+		if (!strncmp(cbuf, "exit", 4)) {
+			terminate = 1;
+		} else if (!strncmp(cbuf, "isr", 3)) {
+			if (isr_run == 0) {
+				// start scu timer
+				print(" * start timer...\n");
+				XScuTimer_Start(&pTimer);
+				isr_run = 1;
+			} else {
+				// stop scu timer
+				print(" * stop timer...\n");
+				XScuTimer_Stop(&pTimer);
+				isr_run = 0;
+			}
+			xil_printf("ISR count: %d\n", ISR_Count);
+		} else if (cbuf[0] == 'r') {
+			print(" reg    content (hex)\n\r");
+			print("---------------------\n\r");
+			for (kk = 0; kk < NREGS; kk++) {
+				xil_printf("   %d    %x\n\r", kk, (unsigned int) ZEDBP_REG(kk));
+			}
+			print("---------------------\n\r");
+		} else if (cbuf[0] == 'w') {
+			if (sscanf(&cbuf[1], "%d %x", &regn, &regval) != 2) {
+				print(" *** illegal parameters\n\r");
+			} else {
+				xil_printf(" => writing %x to R%d.\n\r", regval, regn);
+				ZEDBP_REG(regn) = regval;
+			}
+		} else {
+			xil_printf(" *** unknown command |%s|\n", cbuf);
+		}
+	} while (terminate == 0);
+}
+
+void init_event_handlers(void) {
+	ISR_LEDs = 1;
+	ISR_Count = 0;
+	Xil_ExceptionInit();
+
+	IntcConfig = XScuGic_LookupConfig(XPAR_SCUGIC_0_DEVICE_ID);
+	XScuGic_CfgInitialize(&Intc, IntcConfig, IntcConfig->CpuBaseAddress);
+
+	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_IRQ_INT,
+			(Xil_ExceptionHandler) XScuGic_InterruptHandler, &Intc);
+
+	pTimerConfig = XScuTimer_LookupConfig(XPAR_XSCUTIMER_0_DEVICE_ID);
+	XScuTimer_CfgInitialize(&pTimer, pTimerConfig, pTimerConfig->BaseAddr);
+	XScuTimer_EnableAutoReload(&pTimer);
+	XScuTimer_LoadTimer(&pTimer, TIMER_LOAD_VALUE);
+
+	XScuGic_Connect(&Intc, XPAR_SCUTIMER_INTR,
+			(Xil_ExceptionHandler) TimerIntrHandler, (void *) &pTimer);
+	XScuGic_Enable(&Intc, XPAR_SCUTIMER_INTR);
+	XScuTimer_EnableInterrupt(&pTimer);
+
+	Xil_ExceptionEnable();
+}
+
+void stop_event_handlers() {
+	XScuTimer_Stop(&pTimer);
+	Xil_ExceptionDisable();
+
+	XScuTimer_DisableInterrupt(&pTimer);
+	XScuGic_Disable(&Intc, XPAR_SCUTIMER_INTR);
+}
+
+static void calibration(void)
+{
+	AD5624R    * dac = AD5624R_instance();
+	MCP6S2X    * pga = MCP6S2X_instance();
+	AD7887     * adc = AD7887_instance();
+	LightProbe * probe = LightProbe_instance();
+	uint16_t red, ired;
+	LightProbe_Light light;
+
+	probe->light(LIGHTPROBE_RED);
+	red = adc->read_analog();
+
+	probe->light(LIGHTPROBE_INFRARED);
+	ired = adc->read_analog();
+
+	probe->light(LIGHTPROBE_OFF);
+
+	if (red > ired)
+	{
+		light = LIGHTPROBE_RED;
+	}
+	else
+	{
+		light = LIGHTPROBE_INFRARED;
+	}
+}
+
+void poxi_test(void) {
+	AD5624R    * dac = AD5624R_instance();
+	MCP6S2X    * pga = MCP6S2X_instance();
+	AD7887     * adc = AD7887_instance();
+	LightProbe * probe = LightProbe_instance();
+	ZYBO       * zybo = ZYBO_instance();
+
+	FramePanel * frame = FramePanel_new(0, 0, MAX_WIDTH -1, MAX_HEIGHT -1, WHITE, BLACK);
+	TextLabel * number_label = TextLabel_new(100, 200, 0, 0, NULL, RED, 777);
+	Plot2D * graph = Plot2D_new(30, 100, 100, 50, RED, NAVY);
+
+	int16_t y;
+
+	frame->give_widget(frame, (Widget *)graph);
+	frame->give_widget(frame, (Widget *)number_label);
+	number_label->set_label_type(number_label, NUMBER);
+	number_label->set_font_size(number_label, 2);
+
+
+	dac->reset();
+	dac->LDAC_setup(0);
+	dac->power_mode(NORMAL_OPERATION, 0xF);
+	dac->internal_reference(REFERENCE_ON);
+
+	frame->draw((Widget *)frame);
+
+	pga->set_gain(GAIN_1);
+	do {
+		probe->light(LIGHTPROBE_OFF);
+		y = adc->read_analog();
+		graph->add_point(graph, y>>3, WHITE);
+
+		number_label->set_number(number_label, y);
+
+
+		dac->write_input_register(DAC_ALL, 0xFFF);
+		dac->update_DAC_register(DAC_ALL);
+
+	} while (zybo->switch_(3));
+	frame->delete((Widget **) &frame);
+}
+
+int main() {
+	TFTGraphics * graphics = TFTGraphics_instance();
+
+	init_platform();
+	init_event_handlers();
+
+	printf("Pulse oximeter 2017\n");
+
+	graphics->initialize();
+	graphics->speed(0xF0);
+	graphics->drawLine(00, 00, ILI9341_WIDTH, ILI9341_HEIGHT, RED);
+	graphics->speed(0xFE);
+
+	XScuTimer_Start(&pTimer);
+
+	poxi_test();
+	//test_PGA_routine();
+
+	ZYBO_instance()->leds(0);
+
+	stop_event_handlers();
+	cleanup_platform();
+	printf("END\n");
+	return 0;
+}
+

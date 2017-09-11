@@ -1,0 +1,18 @@
+/*
+ * poxi.h
+ *
+ *  Created on: 11 de feb. de 2017
+ *      Author: Yarib Nevárez
+ */
+
+#ifndef SRC_POXI_H_
+#define SRC_POXI_H_
+#include "xil_types.h"
+
+typedef struct
+{
+	uint8_t initialize(void){}
+} Poxi;
+
+Poxi * Poxi_instance(vois);
+#endif /* SRC_POXI_H_ */

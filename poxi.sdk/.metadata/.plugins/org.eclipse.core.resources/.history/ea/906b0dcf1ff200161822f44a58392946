@@ -1,0 +1,29 @@
+/*
+ * main.c
+ *
+ *  Created on: 13 de feb. de 2017
+ *      Author: Yarib Nevárez
+ */
+
+#include "poxi.h"
+
+int main()
+{
+	int rc = 0;
+	Poxi * App = Poxi_instance();
+
+	if (App != NULL)
+	{
+		rc = App->initialize();
+
+		if (rc)
+		{
+			rc = App->run();
+		}
+
+		App->disposal();
+	}
+
+	return rc;
+}
+
